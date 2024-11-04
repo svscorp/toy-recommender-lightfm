@@ -469,11 +469,16 @@ class ToyRecommenderEnhanced:
                 # Transform ratings to better handle negative feedback
                 rating = row['rating']
                 if rating == 0:
-                    transformed_rating = -1.0  # Strong negative signal
-                    weight = 2.0  # Give more weight to negative feedback
+                    transformed_rating = -0.5  # Less extreme negative signal
+                    weight = 1.5  # Slightly reduced weight
                 else:
-                    transformed_rating = rating / 5.0  # Normalize positive ratings
+                    transformed_rating = (rating / 5.0) * 2 - 1  # Scale to [-1, 1]
                     weight = 1.0
+
+                item_attr = json.loads(row['target_recommendation_attributes'])
+                user_prefs = json.loads(row['target_user_attributes'])['preferences']
+                if 'type' in user_prefs and item_attr['type'] not in user_prefs['type']:
+                    weight *= 1.5  # Increase weight for type mismatches
 
                 data.append(transformed_rating)
                 weights.append(weight)
@@ -560,7 +565,8 @@ class ToyRecommenderEnhanced:
         metrics.rmse = float(rmse_value)
         metrics.train_size = len(actual_ratings)
         metrics.validation_accuracy = validation_accuracy
-        metrics.average_rating = float(np.mean(actual_ratings))
+        original_scale_ratings = (actual_ratings + 1) * 2.5  # Convert from [-1,1] to [0,5] scale
+        metrics.average_rating = float(np.mean(original_scale_ratings))
 
         return metrics
 
@@ -699,11 +705,11 @@ class ToyRecommenderEnhanced:
 
         # Preference type weights
         preference_weights = {
-            'color': 0.15,
-            'brand': 0.25,
-            'material': 0.2,
-            'type': 0.3,
-            'size': 0.15
+            'type': 0.5,     # Increased significantly
+            'brand': 0.3,    # Increased
+            'material': 0.1,
+            'color': 0.05,
+            'size': 0.05
         }
 
         for i in range(len(items)):
@@ -771,22 +777,24 @@ class ToyRecommenderEnhanced:
         else:
             valid_items = self.items_df
 
-        # If we're in cold start (no feedback data) or model hasn't been fitted
-        if len(self.feedback_db) == 0:
-            # Use simple rule-based scoring
+        # Determine if we're in cold start
+        is_cold_start = len(self.feedback_db) == 0
+
+        # Get base scores
+        if is_cold_start:
             scores = self._cold_start_scoring(user_data, valid_items)
         else:
             try:
                 # Create feature matrices for all items
                 item_features = csr_matrix(np.array([
                     self._create_item_features(item)
-                    for _, item in self.items_df.iterrows()  # Use full items_df
+                    for _, item in self.items_df.iterrows()
                 ]))
 
                 # Get indices of valid items
                 valid_indices = valid_items.index.values
 
-                # Try to use the trained model
+                # Get model predictions
                 scores = [
                     self.model.predict(
                         user_ids=[0],
@@ -797,8 +805,51 @@ class ToyRecommenderEnhanced:
                     for idx in valid_indices
                 ]
             except ValueError:
-                # If model isn't fitted, use cold start scoring
                 scores = self._cold_start_scoring(user_data, valid_items)
+                is_cold_start = True  # Treat as cold start if model fails
+
+        # Apply preference boosting if we have trained model predictions
+        if not is_cold_start and 'preferences' in user_data:
+            prefs = user_data['preferences']
+
+            # Define boost factors for each preference type
+            preference_boosts = {
+                'type': 1.5,    # 50% boost for matching type
+                'brand': 1.3,   # 30% boost for matching brand
+                'material': 1.1,  # 10% boost for matching material
+                'color': 1.05    # 5% boost for matching color
+            }
+
+            # Calculate user's feedback history to determine model confidence
+            user_feedback_count = len(self.feedback_db[
+                self.feedback_db['user_id'] == user_id
+            ])
+            model_confidence = min(0.8, user_feedback_count / 20)  # Cap at 0.8
+
+            # Apply boosts and penalties
+            for i, item in enumerate(valid_items.iterrows()):
+                item_data = item[1]
+
+                # Calculate preference match score
+                match_score = 0.0
+                for pref_type, boost in preference_boosts.items():
+                    if pref_type in prefs and prefs[pref_type]:  # Check if preference exists and not empty
+                        if item_data[pref_type] in prefs[pref_type]:
+                            match_score += (boost - 1.0)  # Convert boost to additive score
+                        else:
+                            match_score -= 0.2  # Penalty for mismatch
+
+                # Blend model score with preference score
+                base_score = scores[i]
+                preference_influence = 1.0 - model_confidence
+                scores[i] = (base_score * model_confidence +
+                            match_score * preference_influence)
+
+                # Additional penalties for critical mismatches
+                if 'type' in prefs and item_data['type'] not in prefs['type']:
+                    scores[i] *= 0.5  # Significant penalty for wrong type
+                if age_inappropriate(user_data['age'], item_data['size']):
+                    scores[i] *= 0.3  # Heavy penalty for age-inappropriate sizes
 
         # Get top N recommendations
         top_indices = np.argsort(scores)[-n_recommendations:][::-1]
@@ -813,7 +864,8 @@ class ToyRecommenderEnhanced:
                 'color': item['color'],
                 'brand': item['brand'],
                 'confidence_score': float(scores[idx]),
-                'price_range': item['price_range']
+                'price_range': item['price_range'],
+                'is_cold_start': is_cold_start  # Add flag to indicate if this was cold start
             }
 
             # Store recommendation in database
@@ -892,6 +944,7 @@ class ToyRecommenderEnhanced:
             rows = []
             cols = []
             data = []
+            weights = []  # Added weights for different feedback types
 
             for idx, row in self.feedback_db.iterrows():
                 user_idx = self.user_encoder.fit_transform([row['user_id']])[0]
@@ -910,10 +963,32 @@ class ToyRecommenderEnhanced:
                     item_idx = matching_items.index[0]
                     rows.append(user_idx)
                     cols.append(item_idx)
-                    data.append(row['rating'])
 
+                    # Transform ratings to better handle extremes
+                    rating = row['rating']
+                    if rating == 0:
+                        transformed_rating = -0.5  # Less extreme negative
+                        weight = 1.5  # Higher weight for negative feedback
+                    else:
+                        transformed_rating = (rating / 5.0) * 2 - 1  # Scale to [-1, 1]
+                        weight = 1.0
+
+                    # Adjust weight based on preference matching
+                    user_prefs = json.loads(row['target_user_attributes'])['preferences']
+                    if 'type' in user_prefs and item_attr['type'] not in user_prefs['type']:
+                        weight *= 1.5  # Increase weight for type mismatches
+
+                    data.append(transformed_rating)
+                    weights.append(weight)
+
+            # Create interaction and weight matrices
             interactions = coo_matrix(
                 (data, (rows, cols)),
+                shape=(n_users, n_items)
+            )
+
+            weight_matrix = coo_matrix(
+                (weights, (rows, cols)),
                 shape=(n_users, n_items)
             )
 
@@ -927,45 +1002,61 @@ class ToyRecommenderEnhanced:
             # Fit model
             self.model.fit(
                 interactions,
+                sample_weight=weight_matrix,
                 user_features=user_features,
                 item_features=item_features,
                 epochs=30,
-                num_threads=4
+                num_threads=4,
+                verbose=True
             )
+
+            # Log training completion
+            logging.info("Model training completed")
+
+def age_inappropriate(age: int, size: str) -> bool:
+    """Helper function to determine if size is inappropriate for age."""
+    if age < 3 and size != 'small':
+        return True
+    if 3 <= age <= 7 and size == 'large':
+        return True
+    if age > 7 and size == 'small':
+        return True
+    return False
+
 
 # Example usage
 if __name__ == "__main__":
     recommender = ToyRecommenderEnhanced()
 
-    # # Add a user
-    # recommender.db.add_user(1, 6, "male")
-    # recommender.db.add_user(2, 11, "female")
-    #
-    # # Add user preferences in the new format
-    # user1_preferences = {
-    #     'color': ['blue', 'yellow', 'white'],
-    #     'brand': ['LEGO', 'Hot Wheels'],
-    #     'material': ['plastic', 'wood'],
-    #     'type': ['vehicle', 'constructor', 'outdoor']
-    # }
-    #
-    # user2_preferences = {
-    #     'color': ['blue', 'gold', 'black'],
-    #     'brand': ['LOL', 'LEGO'],
-    #     'material': ['plastic', 'fabric'],
-    #     'type': ['arts_crafts', 'electronic']
-    # }
-    #
-    # recommender.db.add_user_preferences(1, user1_preferences)
-    # recommender.db.add_user_preferences(2, user2_preferences)
-    #
-    # # Get recommendations based on user preferences
-    # preferences_user_id = 1
+    # Add a user
+    recommender.db.add_user(1, 6, "male")
+    recommender.db.add_user(2, 11, "female")
+
+    # Add user preferences in the new format
+    user1_preferences = {
+        'color': ['blue', 'yellow', 'white'],
+        'brand': ['LEGO', 'Hot Wheels'],
+        'material': ['plastic', 'wood'],
+        'type': ['vehicle', 'constructor', 'outdoor']
+    }
+
+    user2_preferences = {
+        'color': ['blue', 'gold', 'black'],
+        'brand': ['LOL', 'LEGO'],
+        'material': ['plastic', 'fabric'],
+        'type': ['arts_crafts', 'electronic']
+    }
+
+    recommender.db.add_user_preferences(1, user1_preferences)
+    recommender.db.add_user_preferences(2, user2_preferences)
+
+    # Get recommendations based on user preferences
+    # preferences_user_id = 2
     # preferences_user_data = recommender.db.get_user_preferences(preferences_user_id)
     #
     # user_data = {
-    #     'age': 6,
-    #     'gender': 'male',
+    #     'age': 11,
+    #     'gender': 'female',
     #     'preferences': preferences_user_data
     # }
     #
@@ -975,7 +1066,7 @@ if __name__ == "__main__":
     # recommendations = recommender.recommend(
     #     user_id=preferences_user_id,
     #     user_data=user_data,
-    #     price_constraint=25,
+    #     price_constraint=60,
     #     n_recommendations=1
     # )
     # #
@@ -990,68 +1081,67 @@ if __name__ == "__main__":
     #     print(f"Brand: {rec['brand']}")
     #     print(f"Price Range: {rec['price_range']}")
     #     print(f"Confidence Score: {rec['confidence_score']:.2f}")
-
-# Record feedback
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=51,
-#         rating=0
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=52,
-#         rating=4
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=53,
-#         rating=3
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=54,
-#         rating=4
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=55,
-#         rating=3
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=56,
-#         rating=3
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=57,
-#         rating=0
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=58,
-#         rating=3
-#     )
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=59,
-#         rating=3
-#     )
-#
-#
-#     recommender.record_feedback(
-#         user_id=1,
-#         recommendation_id=60,
-#         rating=3
-#     )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=71,
+    #     rating=4
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=72,
+    #     rating=0
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=73,
+    #     rating=5
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=74,
+    #     rating=4
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=75,
+    #     rating=3
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=76,
+    #     rating=4
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=77,
+    #     rating=2
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=78,
+    #     rating=0
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=79,
+    #     rating=0
+    # )
+    #
+    #
+    # recommender.record_feedback(
+    #     user_id=2,
+    #     recommendation_id=80,
+    #     rating=5
+    # )
 
 
 
@@ -1059,8 +1149,8 @@ if __name__ == "__main__":
 
     #
     # Train new model version
-    try:
-        metrics = recommender.train_model()
-        print(f"New model trained: {metrics}")
-    except ValueError as e:
-        print(f"Training failed: {e}")
+    # try:
+    #     metrics = recommender.train_model()
+    #     print(f"New model trained: {metrics}")
+    # except ValueError as e:
+    #     print(f"Training failed: {e}")
