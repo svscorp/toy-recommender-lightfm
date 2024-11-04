@@ -37,7 +37,7 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
-            # Users table
+            # Users table (unchanged)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,
@@ -47,25 +47,24 @@ class DatabaseManager:
                 )
             """)
 
-            # User preferences table (many-to-many relationships)
+            # Modified user preferences table - removed score
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS user_preferences (
                     preference_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT,
-                    preference_type TEXT,  -- 'material', 'color', 'brand', 'toy_type', 'size'
+                    preference_type TEXT,  -- 'material', 'color', 'brand', 'type', 'size'
                     preference_value TEXT,
-                    preference_score FLOAT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 )
             """)
 
-            # Feedback table
+            # Other tables remain unchanged
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS feedback (
                     feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT,
-                    item_attributes TEXT,  -- JSON string of item attributes
+                    item_attributes TEXT,
                     rating FLOAT,
                     price_range TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -73,7 +72,6 @@ class DatabaseManager:
                 )
             """)
 
-            # Model versions table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS model_versions (
                     version TEXT PRIMARY KEY,
@@ -99,41 +97,63 @@ class DatabaseManager:
             )
             conn.commit()
 
-    def add_user_preference(
+    def add_user_preferences(
             self,
             user_id: int,
-            preference_type: str,
-            preference_value: str,
-            preference_score: float
+            preferences: Dict[str, List[str]]
     ):
-        """Add a user preference."""
+        """
+        Add multiple user preferences.
+
+        Args:
+            user_id: User identifier
+            preferences: Dictionary where keys are preference types
+                        (color, brand, etc.) and values are lists of
+                        preferred values
+        """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+
+            # First delete existing preferences for this user
             cursor.execute(
-                """INSERT INTO user_preferences 
-                   (user_id, preference_type, preference_value, preference_score)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, preference_type, preference_value, preference_score)
+                "DELETE FROM user_preferences WHERE user_id = ?",
+                (user_id,)
             )
+
+            # Add new preferences
+            for pref_type, values in preferences.items():
+                for value in values:
+                    cursor.execute(
+                        """INSERT INTO user_preferences 
+                           (user_id, preference_type, preference_value)
+                           VALUES (?, ?, ?)""",
+                        (user_id, pref_type, value)
+                    )
+
             conn.commit()
 
-    def get_user_preferences(self, user_id: int) -> Dict:
-        """Get all preferences for a user."""
+    def get_user_preferences(self, user_id: int) -> Dict[str, List[str]]:
+        """
+        Get all preferences for a user.
+
+        Returns:
+            Dictionary where keys are preference types and values are
+            lists of preferred values
+        """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT preference_type, preference_value, preference_score 
+                """SELECT preference_type, preference_value 
                    FROM user_preferences WHERE user_id = ?""",
                 (user_id,)
             )
+
             preferences = {}
-            for pref_type, value, score in cursor.fetchall():
+            for pref_type, value in cursor.fetchall():
                 if pref_type not in preferences:
                     preferences[pref_type] = []
-                preferences[pref_type].append({
-                    'value': value,
-                    'score': score
-                })
+                preferences[pref_type].append(value)
+
             return preferences
 
     def add_feedback(
@@ -239,7 +259,7 @@ class ToyRecommenderEnhanced:
             'color': ['red', 'blue', 'green', 'yellow', 'pink', 'white', 'black',
                       'multicolor'],
             'brand': ['LEGO', 'Fisher-Price', 'Mattel', 'Hasbro', 'Melissa & Doug',
-                      'Little Tikes']
+                      'Little Tikes', 'LOL', 'Hot Wheels']
         }
 
         # Generate synthetic items
@@ -457,8 +477,16 @@ class ToyRecommenderEnhanced:
         scores = np.zeros(len(items))
 
         age = user_data.get('age', 5)
-        gender = user_data.get('gender', 'other')
         preferences = user_data.get('preferences', {})
+
+        # Preference type weights
+        preference_weights = {
+            'color': 0.15,
+            'brand': 0.25,
+            'material': 0.2,
+            'type': 0.25,
+            'size': 0.15
+        }
 
         for i in range(len(items)):
             item = items.iloc[i]
@@ -475,27 +503,15 @@ class ToyRecommenderEnhanced:
                 if item['size'] in ['medium', 'large']:
                     score += 0.2
 
-            # Educational preference
-            if preferences.get('educational', 0.5) > 0.7:
-                if item['type'] in ['educational', 'constructor']:
-                    score += 0.3
+            # Preference matching
+            for pref_type, pref_values in preferences.items():
+                if pref_type in preference_weights:
+                    weight = preference_weights[pref_type]
+                    # If item attribute matches any of the user's preferences for this type
+                    if item[pref_type] in pref_values:
+                        score += weight
 
-            # Creative preference
-            if preferences.get('creative', 0.5) > 0.7:
-                if item['type'] in ['arts_crafts', 'constructor']:
-                    score += 0.3
-
-            # Active preference
-            if preferences.get('active', 0.5) > 0.7:
-                if item['type'] in ['outdoor', 'vehicle']:
-                    score += 0.3
-
-            # Social preference
-            if preferences.get('social', 0.7) > 0.7:
-                if item['type'] in ['doll', 'furniture']:
-                    score += 0.3
-
-            # Age safety adjustment
+            # Safety adjustments
             if age < 3 and item['material'] in ['metal', 'small']:
                 score -= 0.4
 
@@ -645,18 +661,32 @@ class ToyRecommenderEnhanced:
 if __name__ == "__main__":
     recommender = ToyRecommenderEnhanced()
 
-    # Add a user
-    recommender.db.add_user(1, 6, "male")
-    recommender.db.add_user(2, 11, "female")
+    # # Add a user
+    # recommender.db.add_user(1, 6, "male")
+    # recommender.db.add_user(2, 11, "female")
+    #
+    # # Add user preferences in the new format
+    # user1_preferences = {
+    #     'color': ['blue', 'yellow', 'white'],
+    #     'brand': ['LEGO', 'Hot Wheels'],
+    #     'material': ['plastic', 'wood'],
+    #     'type': ['vehicle', 'constructor', 'outdoor']
+    # }
+    #
+    # user2_preferences = {
+    #     'color': ['blue', 'gold', 'black'],
+    #     'brand': ['LOL', 'LEGO'],
+    #     'material': ['plastic', 'fabric'],
+    #     'type': ['arts_crafts', 'electronic']
+    # }
 
-    # Add user preferences
-    recommender.db.add_user_preference(1, "material", "wood", 0.8)
-    recommender.db.add_user_preference(2, "type", "educational", 0.9)
+    # recommender.db.add_user_preferences(1, user1_preferences)
+    # recommender.db.add_user_preferences(2, user2_preferences)
 
     # Get recommendations based on user preferences
     user_data = {
         'age': 6,
-        'gender': 'female',
+        'gender': 'male',
         'preferences': recommender.db.get_user_preferences(1)
     }
 
@@ -666,17 +696,17 @@ if __name__ == "__main__":
         n_recommendations=3
     )
 
-    # Record feedback
-    recommender.db.add_feedback(
-        user_id=1,
-        item_attributes=recommendations[0],
-        rating=4.5,
-        price_range="medium"
-    )
-
-    # Train new model version
-    try:
-        metrics = recommender.train_model()
-        print(f"New model trained: {metrics}")
-    except ValueError as e:
-        print(f"Training failed: {e}")
+# # Record feedback
+    # recommender.db.add_feedback(
+    #     user_id=1,
+    #     item_attributes=recommendations[0],
+    #     rating=4.5,
+    #     price_range="medium"
+    # )
+    #
+    # # Train new model version
+    # try:
+    #     metrics = recommender.train_model()
+    #     print(f"New model trained: {metrics}")
+    # except ValueError as e:
+    #     print(f"Training failed: {e}")
