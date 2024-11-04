@@ -15,6 +15,9 @@ from sklearn.model_selection import train_test_split
 from dataclasses import dataclass
 from pathlib import Path
 
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+
 @dataclass
 class ModelMetrics:
     """Data class for model metrics."""
@@ -63,15 +66,19 @@ class DatabaseManager:
             # Other tables remain unchanged
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS feedback (
-                    feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT,
-                    recommendation_id INTEGER,
-                    item_attributes TEXT,  -- Duplicated for historical preservation
-                    rating FLOAT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id),
-                    FOREIGN KEY (recommendation_id) REFERENCES recommendations(recommendation_id)
-                )
+                feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,                              -- who gave feedback
+                recommendation_id INTEGER,
+                target_user_id TEXT,                       -- (duplicated for history reasons) who is recommendation for (optional)
+                target_user_attributes TEXT,               -- (duplicated for history reasons) user data used for recommendation
+                target_recommendation_attributes TEXT,     -- (duplicated for history reasons) recommendation itself
+                model_version TEXT,                        -- added model_version
+                rating FLOAT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (recommendation_id) REFERENCES recommendations(recommendation_id),
+                FOREIGN KEY (model_version) REFERENCES model_versions(version)
+            )
             """)
 
             cursor.execute("""
@@ -90,15 +97,18 @@ class DatabaseManager:
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS recommendations (
-                    recommendation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT,
-                    item_attributes TEXT,
-                    confidence_score FLOAT,
-                    model_version TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id),
-                    FOREIGN KEY (model_version) REFERENCES model_versions(version)
-                )
+                recommendation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,                              -- who made the recommendation
+                target_user_id TEXT,                       -- who is recommendation for (optional)
+                target_user_attributes TEXT,               -- user data used for recommendation
+                target_recommendation_attributes TEXT,      -- renamed from item_attributes
+                confidence_score FLOAT,
+                model_version TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (target_user_id) REFERENCES users(user_id),
+                FOREIGN KEY (model_version) REFERENCES model_versions(version)
+            )
             """)
 
             conn.commit()
@@ -175,7 +185,9 @@ class DatabaseManager:
     def add_recommendation(
             self,
             user_id: int,
-            item_attributes: Dict,
+            target_user_id: Optional[int],
+            target_user_attributes: Dict,
+            target_recommendation_attributes: Dict,
             confidence_score: float,
             model_version: str
     ) -> int:
@@ -187,9 +199,11 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """INSERT INTO recommendations 
-                   (user_id, item_attributes, confidence_score, model_version)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, json.dumps(item_attributes), confidence_score, model_version)
+                   (user_id, target_user_id, target_user_attributes,
+                    target_recommendation_attributes, confidence_score, model_version)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, target_user_id, json.dumps(target_user_attributes),
+                 json.dumps(target_recommendation_attributes), confidence_score, model_version)
             )
             conn.commit()
             return cursor.lastrowid
@@ -198,7 +212,10 @@ class DatabaseManager:
             self,
             user_id: int,
             recommendation_id: int,
-            item_attributes: Dict,
+            target_user_id: Optional[int],
+            target_user_attributes: Dict,
+            target_recommendation_attributes: Dict,
+            model_version: str,
             rating: float,
     ):
         """Record user feedback."""
@@ -206,9 +223,13 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """INSERT INTO feedback 
-                   (user_id, recommendation_id, item_attributes, rating)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, recommendation_id, json.dumps(item_attributes), rating)
+                   (user_id, recommendation_id, target_user_id, target_user_attributes, target_recommendation_attributes,
+                    model_version, rating)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, recommendation_id, target_user_id,
+                 json.dumps(target_user_attributes),
+                 json.dumps(target_recommendation_attributes),
+                 model_version, rating)
             )
             conn.commit()
 
@@ -300,7 +321,13 @@ class ToyRecommenderEnhanced:
 
         # Initialize feedback database as DataFrame
         self.feedback_db = pd.DataFrame(columns=[
-            'user_id', 'item_attributes', 'rating', 'timestamp'
+            'user_id',
+            'target_user_id',
+            'target_user_attributes',
+            'target_recommendation_attributes',
+            'model_version',
+            'rating',
+            'timestamp'
         ])
 
         # Load existing feedback from database if any exists
@@ -320,7 +347,8 @@ class ToyRecommenderEnhanced:
             loss='warp',
             no_components=64,
             user_alpha=1e-6,
-            item_alpha=1e-6
+            item_alpha=1e-6,
+            max_sampled=30
         )
 
         # Create initial empty interaction matrix
@@ -386,7 +414,8 @@ class ToyRecommenderEnhanced:
             loss='warp',
             no_components=64,
             user_alpha=1e-6,
-            item_alpha=1e-6
+            item_alpha=1e-6,
+            max_sampled=30
         )
 
         # Train model and compute metrics
@@ -410,7 +439,6 @@ class ToyRecommenderEnhanced:
 
     def _prepare_interactions(self, feedback_data: pd.DataFrame) -> Tuple[coo_matrix, coo_matrix]:
         """Prepare interaction matrices from feedback data."""
-        """Prepare interaction matrices from feedback data."""
         n_users = len(feedback_data['user_id'].unique())
         n_items = len(self.items_df)
 
@@ -418,10 +446,11 @@ class ToyRecommenderEnhanced:
         rows = []
         cols = []
         data = []
+        weights = []
 
         for idx, row in feedback_data.iterrows():
             user_idx = self.user_encoder.fit_transform([row['user_id']])[0]
-            item_attr = json.loads(row['item_attributes'])
+            item_attr = json.loads(row['target_recommendation_attributes'])
 
             # Find the corresponding item in items_df
             matching_items = self.items_df[
@@ -436,7 +465,18 @@ class ToyRecommenderEnhanced:
                 item_idx = matching_items.index[0]
                 rows.append(user_idx)
                 cols.append(item_idx)
-                data.append(row['rating'])
+
+                # Transform ratings to better handle negative feedback
+                rating = row['rating']
+                if rating == 0:
+                    transformed_rating = -1.0  # Strong negative signal
+                    weight = 2.0  # Give more weight to negative feedback
+                else:
+                    transformed_rating = rating / 5.0  # Normalize positive ratings
+                    weight = 1.0
+
+                data.append(transformed_rating)
+                weights.append(weight)
 
         # Create interactions matrix
         interactions = coo_matrix(
@@ -444,13 +484,13 @@ class ToyRecommenderEnhanced:
             shape=(n_users, n_items)
         )
 
-        # Create weights matrix (all 1.0 for now)
-        weights = coo_matrix(
-            (np.ones_like(data), (rows, cols)),
+        # Create weights matrix
+        weights_matrix = coo_matrix(
+            (weights, (rows, cols)),
             shape=(n_users, n_items)
         )
 
-        return interactions, weights
+        return interactions, weights_matrix
 
     def _train_and_evaluate(
             self,
@@ -662,36 +702,40 @@ class ToyRecommenderEnhanced:
             'color': 0.15,
             'brand': 0.25,
             'material': 0.2,
-            'type': 0.25,
+            'type': 0.3,
             'size': 0.15
         }
 
         for i in range(len(items)):
             item = items.iloc[i]
-            score = 0.5  # base score
+            score = 0.3  # base score
+
+            # Preference matching with negative scoring for non-matches
+            for pref_type, pref_values in preferences.items():
+                if pref_type in preference_weights:
+                    weight = preference_weights[pref_type]
+                    if item[pref_type] in pref_values:
+                        score += weight
+                    else:
+                        score -= weight * 0.5  # Penalty for non-matching preferences
 
             # Age-based scoring
             if age < 3:
                 if item['size'] == 'small':
-                    score += 0.2
+                    score += 0.1
+                elif item['size'] == 'large':
+                    score -= 0.2
             elif 3 <= age <= 7:
                 if item['size'] == 'medium':
-                    score += 0.2
+                    score += 0.1
             else:  # age > 7
                 if item['size'] in ['medium', 'large']:
-                    score += 0.2
+                    score += 0.1
 
-            # Preference matching
-            for pref_type, pref_values in preferences.items():
-                if pref_type in preference_weights:
-                    weight = preference_weights[pref_type]
-                    # If item attribute matches any of the user's preferences for this type
-                    if item[pref_type] in pref_values:
-                        score += weight
-
-            # Safety adjustments
-            if age < 3 and item['material'] in ['metal', 'small']:
-                score -= 0.4
+            # Strong type preference matching
+            if 'type' in preferences:
+                if item['type'] not in preferences['type']:
+                    score -= 0.4  # Significant penalty for wrong type
 
             scores[i] = max(0.1, min(1.0, score))  # Clamp between 0.1 and 1.0
 
@@ -701,6 +745,7 @@ class ToyRecommenderEnhanced:
             self,
             user_id: int,
             user_data: Dict,
+            target_user_id: Optional[int] = None,
             price_constraint: Optional[float] = None,
             n_recommendations: int = 5
     ) -> List[Dict]:
@@ -774,7 +819,9 @@ class ToyRecommenderEnhanced:
             # Store recommendation in database
             recommendation_id = self.db.add_recommendation(
                 user_id=user_id,
-                item_attributes=recommendation,
+                target_user_id=target_user_id,
+                target_user_attributes=user_data,
+                target_recommendation_attributes=recommendation,
                 confidence_score=float(scores[idx]),
                 model_version=self.active_version
             )
@@ -796,18 +843,24 @@ class ToyRecommenderEnhanced:
         with sqlite3.connect(self.db.db_path) as conn:  # Use self.db.db_path instead
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT item_attributes FROM recommendations WHERE recommendation_id = ?",
+                "SELECT target_user_id, target_user_attributes, target_recommendation_attributes, model_version FROM recommendations WHERE recommendation_id = ?",
                 (recommendation_id,)
             )
             result = cursor.fetchone()
             if result:
-                item_attributes = json.loads(result[0])
+                target_user_id = result[0]
+                target_user_attributes = json.loads(result[1])
+                target_recommendation_attributes = json.loads(result[2])
+                model_version = result[3]
 
                 # Add feedback
                 self.db.add_feedback(
                     user_id=user_id,
                     recommendation_id=recommendation_id,
-                    item_attributes=item_attributes,  # Duplicating for historical preservation
+                    target_user_id=target_user_id,
+                    target_user_attributes=target_user_attributes,
+                    target_recommendation_attributes=target_recommendation_attributes,
+                    model_version=model_version,
                     rating=rating
                 )
 
@@ -816,7 +869,10 @@ class ToyRecommenderEnhanced:
                     self.feedback_db,
                     pd.DataFrame([{
                         'user_id': user_id,
-                        'item_attributes': json.dumps(item_attributes),
+                        'target_user_id': target_user_id,
+                        'target_user_attributes': json.dumps(target_user_attributes),
+                        'target_recommendation_attributes': json.dumps(target_recommendation_attributes),
+                        'model_version': model_version,
                         'rating': rating,
                         'timestamp': datetime.datetime.now(),
                     }])
@@ -837,12 +893,10 @@ class ToyRecommenderEnhanced:
             cols = []
             data = []
 
-            # Create mapping of item_id to index
-            item_to_idx = {str(item_id): idx for idx, item_id in enumerate(self.items_df.index)}
-
             for idx, row in self.feedback_db.iterrows():
                 user_idx = self.user_encoder.fit_transform([row['user_id']])[0]
-                item_attr = json.loads(row['item_attributes'])
+                item_attr = json.loads(row['target_recommendation_attributes'])
+
                 # Find the corresponding item in items_df
                 matching_items = self.items_df[
                     (self.items_df['type'] == item_attr['type']) &
@@ -851,6 +905,7 @@ class ToyRecommenderEnhanced:
                     (self.items_df['color'] == item_attr['color']) &
                     (self.items_df['brand'] == item_attr['brand'])
                     ]
+
                 if not matching_items.empty:
                     item_idx = matching_items.index[0]
                     rows.append(user_idx)
@@ -905,47 +960,107 @@ if __name__ == "__main__":
     # recommender.db.add_user_preferences(2, user2_preferences)
     #
     # # Get recommendations based on user preferences
-    preferences_user_id = 2
-    preferences_user_data = recommender.db.get_user_preferences(preferences_user_id)
-    print(preferences_user_data)
-    user_data = {
-        'age': 11,
-        'gender': 'female',
-        'preferences': preferences_user_data
-    }
+    # preferences_user_id = 1
+    # preferences_user_data = recommender.db.get_user_preferences(preferences_user_id)
     #
-    recommendations = recommender.recommend(
-        user_id=2,
-        user_data=user_data,
-        price_constraint=10,
-        n_recommendations=1
-    )
+    # user_data = {
+    #     'age': 6,
+    #     'gender': 'male',
+    #     'preferences': preferences_user_data
+    # }
+    #
+    # print('===USER DATA===')
+    # print(user_data)
+    # #
+    # recommendations = recommender.recommend(
+    #     user_id=preferences_user_id,
+    #     user_data=user_data,
+    #     price_constraint=25,
+    #     n_recommendations=1
+    # )
+    # #
+    # print('===RECOMMENDATION===')
+    # for i, rec in enumerate(recommendations, 1):
+    #     print(f"\nRecommendation {i}:")
+    #     print(f"Id: {rec['recommendation_id']}")
+    #     print(f"Type: {rec['type']}")
+    #     print(f"Size: {rec['size']}")
+    #     print(f"Material: {rec['material']}")
+    #     print(f"Color: {rec['color']}")
+    #     print(f"Brand: {rec['brand']}")
+    #     print(f"Price Range: {rec['price_range']}")
+    #     print(f"Confidence Score: {rec['confidence_score']:.2f}")
 
-    for i, rec in enumerate(recommendations, 1):
-        print(f"\nRecommendation {i}:")
-        print(f"Id: {rec['recommendation_id']}")
-        print(f"Type: {rec['type']}")
-        print(f"Size: {rec['size']}")
-        print(f"Material: {rec['material']}")
-        print(f"Color: {rec['color']}")
-        print(f"Brand: {rec['brand']}")
-        print(f"Price Range: {rec['price_range']}")
-        print(f"Confidence Score: {rec['confidence_score']:.2f}")
-
-# # # Record feedback
+# Record feedback
 #     recommender.record_feedback(
-#         user_id=2,
-#         recommendation_id=11,
+#         user_id=1,
+#         recommendation_id=51,
 #         rating=0
 #     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=52,
+#         rating=4
+#     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=53,
+#         rating=3
+#     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=54,
+#         rating=4
+#     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=55,
+#         rating=3
+#     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=56,
+#         rating=3
+#     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=57,
+#         rating=0
+#     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=58,
+#         rating=3
+#     )
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=59,
+#         rating=3
+#     )
+#
+#
+#     recommender.record_feedback(
+#         user_id=1,
+#         recommendation_id=60,
+#         rating=3
+#     )
+
+
+
+    # recommender.fit()
 
     #
-    # # recommender.fit()
-    #
-    # #
-    # # Train new model version
-    # try:
-    #     metrics = recommender.train_model()
-    #     print(f"New model trained: {metrics}")
-    # except ValueError as e:
-    #     print(f"Training failed: {e}")
+    # Train new model version
+    try:
+        metrics = recommender.train_model()
+        print(f"New model trained: {metrics}")
+    except ValueError as e:
+        print(f"Training failed: {e}")
