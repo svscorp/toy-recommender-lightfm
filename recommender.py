@@ -74,6 +74,7 @@ class DatabaseManager:
                 target_recommendation_attributes TEXT,     -- (duplicated for history reasons) recommendation itself
                 model_version TEXT,                        -- added model_version
                 rating FLOAT,
+                is_target_user_feedback INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id),
                 FOREIGN KEY (recommendation_id) REFERENCES recommendations(recommendation_id),
@@ -182,6 +183,24 @@ class DatabaseManager:
 
             return preferences
 
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """Get user data from the database."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id, age, gender FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            result = cursor.fetchone()
+
+            if result:
+                return {
+                    'user_id': result[0],
+                    'age': result[1],
+                    'gender': result[2]
+                }
+            return None
+
     def add_recommendation(
             self,
             user_id: int,
@@ -224,12 +243,12 @@ class DatabaseManager:
             cursor.execute(
                 """INSERT INTO feedback 
                    (user_id, recommendation_id, target_user_id, target_user_attributes, target_recommendation_attributes,
-                    model_version, rating)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    model_version, rating, is_target_user_feedback)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user_id, recommendation_id, target_user_id,
                  json.dumps(target_user_attributes),
                  json.dumps(target_recommendation_attributes),
-                 model_version, rating)
+                 model_version, rating, 1 if user_id == target_user_id else 0)
             )
             conn.commit()
 
@@ -307,13 +326,13 @@ class ToyRecommenderEnhanced:
         # Define possible values for each attribute
         self.attribute_values = {
             'type': ['doll', 'constructor', 'vehicle', 'furniture', 'educational',
-                     'arts_crafts', 'outdoor', 'electronic'],
+                     'arts_crafts', 'outdoor', 'electronic', 'clothing'],
             'size': ['small', 'medium', 'large'],
             'material': ['plastic', 'wood', 'metal', 'fabric', 'leather'],
             'color': ['red', 'blue', 'green', 'yellow', 'pink', 'white', 'black',
                       'multicolor'],
             'brand': ['LEGO', 'Fisher-Price', 'Mattel', 'Hasbro', 'Melissa & Doug',
-                      'Little Tikes', 'LOL', 'Hot Wheels']
+                      'Little Tikes', 'LOL', 'Hot Wheels', 'DJI', 'Apple', 'Tesla', 'New Balance']
         }
 
         # Generate synthetic items BEFORE model creation
@@ -479,6 +498,9 @@ class ToyRecommenderEnhanced:
                 user_prefs = json.loads(row['target_user_attributes'])['preferences']
                 if 'type' in user_prefs and item_attr['type'] not in user_prefs['type']:
                     weight *= 1.5  # Increase weight for type mismatches
+
+                if row['is_target_user_feedback'] == 1:
+                    weight *= 1.2  # Give more weight to target user feedback
 
                 data.append(transformed_rating)
                 weights.append(weight)
@@ -750,12 +772,26 @@ class ToyRecommenderEnhanced:
     def recommend(
             self,
             user_id: int,
-            user_data: Dict,
+            user_data: Optional[Dict] = None,
             target_user_id: Optional[int] = None,
             price_constraint: Optional[float] = None,
             n_recommendations: int = 5
     ) -> List[Dict]:
         """Get toy recommendations based on user data and constraints."""
+        if target_user_id:
+            # Get user data from tables
+            target_user = self.db.get_user(target_user_id)
+
+            if not target_user:
+                raise ValueError(f"User with id {target_user_id} not found")
+
+            target_preferences = self.db.get_user_preferences(target_user_id)
+            user_data = {
+                'age': target_user['age'],
+                'gender': target_user['gender'],
+                'preferences': target_preferences
+            }
+
         # Create user features
         user_features = csr_matrix(self._create_user_features(user_data).reshape(1, -1))
 
@@ -900,7 +936,7 @@ class ToyRecommenderEnhanced:
             )
             result = cursor.fetchone()
             if result:
-                target_user_id = result[0]
+                target_user_id = int(result[0]) if result[0] else None
                 target_user_attributes = json.loads(result[1])
                 target_recommendation_attributes = json.loads(result[2])
                 model_version = result[3]
@@ -1029,26 +1065,35 @@ if __name__ == "__main__":
     recommender = ToyRecommenderEnhanced()
 
     # Add a user
-    recommender.db.add_user(1, 6, "male")
-    recommender.db.add_user(2, 11, "female")
+    # recommender.db.add_user(1, 6, "male")
+    # recommender.db.add_user(2, 11, "female")
+    # recommender.db.add_user(3, 32, "male")
 
     # Add user preferences in the new format
-    user1_preferences = {
-        'color': ['blue', 'yellow', 'white'],
-        'brand': ['LEGO', 'Hot Wheels'],
-        'material': ['plastic', 'wood'],
-        'type': ['vehicle', 'constructor', 'outdoor']
-    }
+    # user1_preferences = {
+    #     'color': ['blue', 'yellow', 'white'],
+    #     'brand': ['LEGO', 'Hot Wheels'],
+    #     'material': ['plastic', 'wood'],
+    #     'type': ['vehicle', 'constructor', 'outdoor']
+    # }
+    #
+    # user2_preferences = {
+    #     'color': ['blue', 'gold', 'black'],
+    #     'brand': ['LOL', 'LEGO'],
+    #     'material': ['plastic', 'fabric'],
+    #     'type': ['arts_crafts', 'electronic']
+    # }
 
-    user2_preferences = {
-        'color': ['blue', 'gold', 'black'],
-        'brand': ['LOL', 'LEGO'],
-        'material': ['plastic', 'fabric'],
-        'type': ['arts_crafts', 'electronic']
-    }
+    # user3_preferences = {
+    #     'color': ['green', 'yellow', 'white'],
+    #     'brand': ['clothing', 'Apple', 'New Balance', 'Tesla'],
+    #     'material': ['wood', 'metal'],
+    #     'type': ['electronic', 'vehicle']
+    # }
 
-    recommender.db.add_user_preferences(1, user1_preferences)
-    recommender.db.add_user_preferences(2, user2_preferences)
+    # recommender.db.add_user_preferences(1, user1_preferences)
+    # recommender.db.add_user_preferences(2, user2_preferences)
+    # recommender.db.add_user_preferences(3, user3_preferences)
 
     # Get recommendations based on user preferences
     # preferences_user_id = 2
@@ -1059,14 +1104,15 @@ if __name__ == "__main__":
     #     'gender': 'female',
     #     'preferences': preferences_user_data
     # }
-    #
+
     # print('===USER DATA===')
-    # print(user_data)
+    # # print(user_data)
     # #
     # recommendations = recommender.recommend(
-    #     user_id=preferences_user_id,
-    #     user_data=user_data,
-    #     price_constraint=60,
+    #     user_id=1,
+    #     # user_data=user_data,
+    #     target_user_id=3,
+    #     price_constraint=10000,
     #     n_recommendations=1
     # )
     # #
@@ -1081,76 +1127,72 @@ if __name__ == "__main__":
     #     print(f"Brand: {rec['brand']}")
     #     print(f"Price Range: {rec['price_range']}")
     #     print(f"Confidence Score: {rec['confidence_score']:.2f}")
-    #
+
     # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=71,
-    #     rating=4
+    #     user_id=3,
+    #     recommendation_id=81,
+    #     rating=1
     # )
     #
     # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=72,
-    #     rating=0
-    # )
-    #
-    # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=73,
-    #     rating=5
-    # )
-    #
-    # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=74,
-    #     rating=4
-    # )
-    #
-    # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=75,
+    #     user_id=3,
+    #     recommendation_id=82,
     #     rating=3
     # )
     #
     # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=76,
-    #     rating=4
-    # )
-    #
-    # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=77,
+    #     user_id=3,
+    #     recommendation_id=83,
     #     rating=2
     # )
     #
     # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=78,
+    #     user_id=3,
+    #     recommendation_id=84,
     #     rating=0
     # )
     #
     # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=79,
-    #     rating=0
+    #     user_id=3,
+    #     recommendation_id=85,
+    #     rating=2
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=3,
+    #     recommendation_id=86,
+    #     rating=1
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=3,
+    #     recommendation_id=87,
+    #     rating=1
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=3,
+    #     recommendation_id=88,
+    #     rating=1
+    # )
+    #
+    # recommender.record_feedback(
+    #     user_id=3,
+    #     recommendation_id=89,
+    #     rating=1
     # )
     #
     #
     # recommender.record_feedback(
-    #     user_id=2,
-    #     recommendation_id=80,
-    #     rating=5
+    #     user_id=3,
+    #     recommendation_id=90,
+    #     rating=2
     # )
-
-
-
-    # recommender.fit()
 
     #
     # Train new model version
-    # try:
-    #     metrics = recommender.train_model()
-    #     print(f"New model trained: {metrics}")
-    # except ValueError as e:
-    #     print(f"Training failed: {e}")
+    try:
+        metrics = recommender.train_model()
+        print(f"New model trained: {metrics}")
+    except ValueError as e:
+        print(f"Training failed: {e}")
