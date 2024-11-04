@@ -8,10 +8,224 @@ from typing import Dict, List, Optional, Tuple
 import logging
 import datetime
 from scipy.sparse import coo_matrix, csr_matrix
+import sqlite3
+import pickle
+import os
+from sklearn.model_selection import train_test_split
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass
+class ModelMetrics:
+    """Data class for model metrics."""
+    version: str
+    accuracy: Optional[float] = None
+    loss: Optional[float] = None
+    train_size: Optional[int] = None
+    validation_accuracy: Optional[float] = None
+    average_rating: Optional[float] = None
+    created_at: datetime.datetime = datetime.datetime.now()
 
 
-class ToyAttributeRecommender:
+class DatabaseManager:
+    def __init__(self, db_path: str = "toy_recommender.db"):
+        self.db_path = db_path
+        self._init_database()
+
+    def _init_database(self):
+        """Initialize database tables."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Users table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    age INTEGER,
+                    gender TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # User preferences table (many-to-many relationships)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    preference_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
+                    preference_type TEXT,  -- 'material', 'color', 'brand', 'toy_type', 'size'
+                    preference_value TEXT,
+                    preference_score FLOAT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            """)
+
+            # Feedback table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS feedback (
+                    feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
+                    item_attributes TEXT,  -- JSON string of item attributes
+                    rating FLOAT,
+                    price_range TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            """)
+
+            # Model versions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS model_versions (
+                    version TEXT PRIMARY KEY,
+                    accuracy FLOAT,
+                    loss FLOAT,
+                    train_dataset_size INTEGER,
+                    validation_accuracy FLOAT,
+                    average_rating FLOAT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 0
+                )
+            """)
+
+            conn.commit()
+
+    def add_user(self, user_id: int, age: int, gender: str):
+        """Add a new user to the database."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO users (user_id, age, gender) VALUES (?, ?, ?)",
+                (user_id, age, gender)
+            )
+            conn.commit()
+
+    def add_user_preference(
+            self,
+            user_id: int,
+            preference_type: str,
+            preference_value: str,
+            preference_score: float
+    ):
+        """Add a user preference."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO user_preferences 
+                   (user_id, preference_type, preference_value, preference_score)
+                   VALUES (?, ?, ?, ?)""",
+                (user_id, preference_type, preference_value, preference_score)
+            )
+            conn.commit()
+
+    def get_user_preferences(self, user_id: int) -> Dict:
+        """Get all preferences for a user."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT preference_type, preference_value, preference_score 
+                   FROM user_preferences WHERE user_id = ?""",
+                (user_id,)
+            )
+            preferences = {}
+            for pref_type, value, score in cursor.fetchall():
+                if pref_type not in preferences:
+                    preferences[pref_type] = []
+                preferences[pref_type].append({
+                    'value': value,
+                    'score': score
+                })
+            return preferences
+
+    def add_feedback(
+            self,
+            user_id: int,
+            item_attributes: Dict,
+            rating: float,
+            price_range: str
+    ):
+        """Record user feedback."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO feedback 
+                   (user_id, item_attributes, rating, price_range)
+                   VALUES (?, ?, ?, ?)""",
+                (user_id, json.dumps(item_attributes), rating, price_range)
+            )
+            conn.commit()
+
+    def get_all_feedback(self) -> pd.DataFrame:
+        """Get all feedback data."""
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query("SELECT * FROM feedback", conn)
+
+    def save_model_metrics(self, metrics: ModelMetrics):
+        """Save model metrics to database."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO model_versions 
+                   (version, accuracy, loss, train_dataset_size,
+                    validation_accuracy, average_rating, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (metrics.version, metrics.accuracy, metrics.loss,
+                 metrics.train_size, metrics.validation_accuracy,
+                 metrics.average_rating, metrics.created_at)
+            )
+            conn.commit()
+
+    def get_active_model_version(self) -> Optional[str]:
+        """Get the currently active model version."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT version FROM model_versions WHERE is_active = 1"
+            )
+            result = cursor.fetchone()
+            return result[0] if result else None
+
+    def set_active_model(self, version: str):
+        """Set the active model version."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE model_versions SET is_active = 0")
+            cursor.execute(
+                "UPDATE model_versions SET is_active = 1 WHERE version = ?",
+                (version,)
+            )
+            conn.commit()
+
+
+class ModelManager:
+    def __init__(self, models_dir: str = "models"):
+        self.models_dir = Path(models_dir)
+        self.models_dir.mkdir(exist_ok=True)
+
+    def save_model(self, model: LightFM, version: str):
+        """Save a model to disk."""
+        model_path = self.models_dir / f"model_{version}.pkl"
+        with open(model_path, 'wb') as f:
+            pickle.dump(model, f)
+
+    def load_model(self, version: str) -> Optional[LightFM]:
+        """Load a model from disk."""
+        model_path = self.models_dir / f"model_{version}.pkl"
+        if model_path.exists():
+            with open(model_path, 'rb') as f:
+                return pickle.load(f)
+        return None
+
+class ToyRecommenderEnhanced:
     def __init__(self):
+        self.db = DatabaseManager()
+        self.model_manager = ModelManager()
+
+        # Load the active model if it exists
+        active_version = self.db.get_active_model_version()
+        self.model = (self.model_manager.load_model(active_version)
+                      if active_version else self._create_initial_model())
+
+        # Initialize other components
         self.dataset = Dataset()
         self.user_encoder = LabelEncoder()
         self.item_encoder = LabelEncoder()
@@ -28,16 +242,12 @@ class ToyAttributeRecommender:
                       'Little Tikes']
         }
 
-        # Generate synthetic items from attribute combinations
+        # Generate synthetic items
         self.items_df = self._generate_item_combinations()
 
-        # Initialize feedback storage
-        self.feedback_db = pd.DataFrame(columns=[
-            'user_id', 'item_id', 'rating', 'timestamp', 'price_range'
-        ])
-
-        # Initialize the model
-        self.model = LightFM(
+    def _create_initial_model(self) -> LightFM:
+        """Create and save initial model."""
+        model = LightFM(
             learning_rate=0.05,
             loss='warp',
             no_components=64,
@@ -45,8 +255,72 @@ class ToyAttributeRecommender:
             item_alpha=1e-6
         )
 
-        # Perform initial fit
-        self._initial_fit()
+        # Save initial model metrics
+        metrics = ModelMetrics(
+            version="v0.1",
+            train_size=0
+        )
+        self.db.save_model_metrics(metrics)
+        self.model_manager.save_model(model, "v0.1")
+        self.db.set_active_model("v0.1")
+
+        return model
+
+    def train_model(self, validate: bool = True) -> ModelMetrics:
+        """Train a new model version."""
+        # Get all feedback data
+        feedback_data = self.db.get_all_feedback()
+        if feedback_data.empty:
+            raise ValueError("No feedback data available for training")
+
+        # Prepare training data
+        train_data, val_data = train_test_split(
+            feedback_data, test_size=0.2 if validate else 0.0
+        )
+
+        # Create new model
+        new_model = LightFM(
+            learning_rate=0.05,
+            loss='warp',
+            no_components=64,
+            user_alpha=1e-6,
+            item_alpha=1e-6
+        )
+
+        # Train model and compute metrics
+        train_interactions, train_weights = self._prepare_interactions(train_data)
+        metrics = self._train_and_evaluate(
+            new_model,
+            train_interactions,
+            train_weights,
+            val_data if validate else None
+        )
+
+        # Save new model and metrics
+        self.model_manager.save_model(new_model, metrics.version)
+        self.db.save_model_metrics(metrics)
+        self.db.set_active_model(metrics.version)
+
+        # Update current model
+        self.model = new_model
+
+        return metrics
+
+    def _prepare_interactions(self, feedback_data: pd.DataFrame) -> Tuple[coo_matrix, coo_matrix]:
+        """Prepare interaction matrices from feedback data."""
+        # Implementation details...
+        pass
+
+    def _train_and_evaluate(
+            self,
+            model: LightFM,
+            train_interactions: coo_matrix,
+            train_weights: coo_matrix,
+            val_data: Optional[pd.DataFrame] = None
+    ) -> ModelMetrics:
+        """Train model and compute metrics."""
+        # Implementation details...
+        pass
 
     def _generate_item_combinations(self) -> pd.DataFrame:
         """Generate realistic combinations of toy attributes."""
@@ -299,7 +573,7 @@ class ToyAttributeRecommender:
 
     def record_feedback(
             self,
-            user_id: str,
+            user_id: int,
             recommendation: Dict,
             rating: float,
             price_range: str
@@ -369,43 +643,40 @@ class ToyAttributeRecommender:
 
 # Example usage
 if __name__ == "__main__":
-    # Initialize recommender
-    recommender = ToyAttributeRecommender()
+    recommender = ToyRecommenderEnhanced()
 
-    # Example user data
+    # Add a user
+    recommender.db.add_user(1, 6, "male")
+    recommender.db.add_user(2, 11, "female")
+
+    # Add user preferences
+    recommender.db.add_user_preference(1, "material", "wood", 0.8)
+    recommender.db.add_user_preference(2, "type", "educational", 0.9)
+
+    # Get recommendations based on user preferences
     user_data = {
         'age': 6,
         'gender': 'female',
-        'preferences': {
-            'educational': 0.8,
-            'creative': 0.9,
-            'active': 0.5,
-            'social': 0.7
-        }
+        'preferences': recommender.db.get_user_preferences(1)
     }
 
-    # Get recommendations
     recommendations = recommender.recommend(
         user_data=user_data,
         price_constraint=50,
         n_recommendations=3
     )
 
-    # Print recommendations
-    for i, rec in enumerate(recommendations, 1):
-        print(f"\nRecommendation {i}:")
-        print(f"Type: {rec['type']}")
-        print(f"Size: {rec['size']}")
-        print(f"Material: {rec['material']}")
-        print(f"Color: {rec['color']}")
-        print(f"Brand: {rec['brand']}")
-        print(f"Price Range: {rec['price_range']}")
-        print(f"Confidence Score: {rec['confidence_score']:.2f}")
+    # Record feedback
+    recommender.db.add_feedback(
+        user_id=1,
+        item_attributes=recommendations[0],
+        rating=4.5,
+        price_range="medium"
+    )
 
-    # # Example of recording feedback
-    # recommender.record_feedback(
-    #     user_id="1",
-    #     recommendation=recommendations[0],
-    #     rating=2,
-    #     price_range="medium"
-    # )
+    # Train new model version
+    try:
+        metrics = recommender.train_model()
+        print(f"New model trained: {metrics}")
+    except ValueError as e:
+        print(f"Training failed: {e}")
