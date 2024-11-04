@@ -19,11 +19,12 @@ from pathlib import Path
 class ModelMetrics:
     """Data class for model metrics."""
     version: str
-    accuracy: Optional[float] = None
-    loss: Optional[float] = None
+    accuracy: Optional[float] = None  # 0-1 scale
+    mae: Optional[float] = None  # actual Mean Absolute Error value
+    rmse: Optional[float] = None  # actual Root Mean Squared Error value
     train_size: Optional[int] = None
-    validation_accuracy: Optional[float] = None
-    average_rating: Optional[float] = None
+    validation_accuracy: Optional[float] = None  # 0-1 scale
+    average_rating: Optional[float] = None # 0-5 scale
     created_at: datetime.datetime = datetime.datetime.now()
 
 
@@ -64,23 +65,39 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS feedback (
                     feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT,
-                    item_attributes TEXT,
+                    recommendation_id INTEGER,
+                    item_attributes TEXT,  -- Duplicated for historical preservation
                     rating FLOAT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                    FOREIGN KEY (user_id) REFERENCES users(user_id),
+                    FOREIGN KEY (recommendation_id) REFERENCES recommendations(recommendation_id)
                 )
             """)
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS model_versions (
                     version TEXT PRIMARY KEY,
-                    accuracy FLOAT,
-                    loss FLOAT,
+                    accuracy FLOAT,          -- 0-1 scale
+                    mae FLOAT,               -- Mean Absolute Error
+                    rmse FLOAT,              -- Root Mean Square Error
                     train_dataset_size INTEGER,
-                    validation_accuracy FLOAT,
+                    validation_accuracy FLOAT,  -- 0-1 scale
                     average_rating FLOAT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     is_active BOOLEAN DEFAULT 0
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS recommendations (
+                    recommendation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
+                    item_attributes TEXT,
+                    confidence_score FLOAT,
+                    model_version TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id),
+                    FOREIGN KEY (model_version) REFERENCES model_versions(version)
                 )
             """)
 
@@ -155,9 +172,32 @@ class DatabaseManager:
 
             return preferences
 
+    def add_recommendation(
+            self,
+            user_id: int,
+            item_attributes: Dict,
+            confidence_score: float,
+            model_version: str
+    ) -> int:
+        """
+        Record a recommendation.
+        Returns: recommendation_id
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO recommendations 
+                   (user_id, item_attributes, confidence_score, model_version)
+                   VALUES (?, ?, ?, ?)""",
+                (user_id, json.dumps(item_attributes), confidence_score, model_version)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
     def add_feedback(
             self,
             user_id: int,
+            recommendation_id: int,
             item_attributes: Dict,
             rating: float,
     ):
@@ -166,9 +206,9 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """INSERT INTO feedback 
-                   (user_id, item_attributes, rating)
-                   VALUES (?, ?, ?)""",
-                (user_id, json.dumps(item_attributes), rating)
+                   (user_id, recommendation_id, item_attributes, rating)
+                   VALUES (?, ?, ?, ?)""",
+                (user_id, recommendation_id, json.dumps(item_attributes), rating)
             )
             conn.commit()
 
@@ -183,10 +223,10 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """INSERT INTO model_versions 
-                   (version, accuracy, loss, train_dataset_size,
+                   (version, accuracy, mae, rmse, train_dataset_size,
                     validation_accuracy, average_rating, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (metrics.version, metrics.accuracy, metrics.loss,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (metrics.version, metrics.accuracy, metrics.mae, metrics.rmse,
                  metrics.train_size, metrics.validation_accuracy,
                  metrics.average_rating, metrics.created_at)
             )
@@ -238,16 +278,6 @@ class ToyRecommenderEnhanced:
         self.db = DatabaseManager()
         self.model_manager = ModelManager()
 
-        # Initialize feedback database as DataFrame
-        self.feedback_db = pd.DataFrame(columns=[
-            'user_id', 'item_attributes', 'rating', 'timestamp'
-        ])
-
-        # Load the active model if it exists
-        active_version = self.db.get_active_model_version()
-        self.model = (self.model_manager.load_model(active_version)
-                      if active_version else self._create_initial_model())
-
         # Initialize other components
         self.dataset = Dataset()
         self.user_encoder = LabelEncoder()
@@ -265,13 +295,23 @@ class ToyRecommenderEnhanced:
                       'Little Tikes', 'LOL', 'Hot Wheels']
         }
 
-        # Generate synthetic items
+        # Generate synthetic items BEFORE model creation
         self.items_df = self._generate_item_combinations()
+
+        # Initialize feedback database as DataFrame
+        self.feedback_db = pd.DataFrame(columns=[
+            'user_id', 'item_attributes', 'rating', 'timestamp'
+        ])
 
         # Load existing feedback from database if any exists
         existing_feedback = self.db.get_all_feedback()
         if not existing_feedback.empty:
             self.feedback_db = existing_feedback
+
+        # Load the active model if it exists
+        self.active_version = self.db.get_active_model_version()
+        self.model = (self.model_manager.load_model(self.active_version)
+                      if self.active_version else self._create_initial_model())
 
     def _create_initial_model(self) -> LightFM:
         """Create and save initial model."""
@@ -420,7 +460,6 @@ class ToyRecommenderEnhanced:
             val_data: Optional[pd.DataFrame] = None
     ) -> ModelMetrics:
         """Train model and compute metrics."""
-        """Train model and compute metrics."""
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         version = f"v{timestamp}"
 
@@ -452,28 +491,35 @@ class ToyRecommenderEnhanced:
             item_features=item_features
         )
 
-        # Calculate RMSE instead of simple accuracy
+        # Calculate metrics
         actual_ratings = train_interactions.data
-        rmse = np.sqrt(np.mean((train_predictions - actual_ratings) ** 2))
-        mae = np.mean(np.abs(train_predictions - actual_ratings))
+        predictions = train_predictions
+
+        # Calculate raw error metrics
+        mae_value = np.mean(np.abs(predictions - actual_ratings))
+        rmse_value = np.sqrt(np.mean((predictions - actual_ratings) ** 2))
+
+        # Calculate normalized accuracy (0-1 scale)
+        max_possible_error = 5.0  # Assuming 5-star rating scale
+        accuracy = 1 - (mae_value / max_possible_error)  # Convert to 0-1 scale
 
         # Calculate validation metrics if validation data is provided
-        validation_rmse = None
+        validation_accuracy = None
         if val_data is not None and not val_data.empty:
-            val_interactions, val_weights = self._prepare_interactions(val_data)
-            val_predictions = model.predict(
-                user_ids=val_interactions.row,
+            val_interactions, _ = self._prepare_interactions(val_data)
+            val_predictions = model.predict(user_ids=val_interactions.row,
                 item_ids=val_interactions.col,
                 user_features=csr_matrix((val_interactions.shape[0], 8)),
-                item_features=item_features
-            )
-            validation_rmse = np.sqrt(np.mean((val_predictions - val_interactions.data) ** 2))
+                item_features=item_features)
+            val_mae = np.mean(np.abs(val_predictions - val_interactions.data))
+            validation_accuracy = 1 - (val_mae / max_possible_error)  # 0-1 scale
 
         # Update metrics
-        metrics.accuracy = float(mae)  # Using MAE instead of binary accuracy
-        metrics.loss = float(rmse)  # Using RMSE as loss
-        metrics.train_size = len(actual_ratings)  # Using actual number of ratings
-        metrics.validation_accuracy = float(validation_rmse) if validation_rmse is not None else None
+        metrics.accuracy = float(accuracy)
+        metrics.mae = float(mae_value)
+        metrics.rmse = float(rmse_value)
+        metrics.train_size = len(actual_ratings)
+        metrics.validation_accuracy = validation_accuracy
         metrics.average_rating = float(np.mean(actual_ratings))
 
         return metrics
@@ -653,6 +699,7 @@ class ToyRecommenderEnhanced:
 
     def recommend(
             self,
+            user_id: int,
             user_data: Dict,
             price_constraint: Optional[float] = None,
             n_recommendations: int = 5
@@ -714,7 +761,7 @@ class ToyRecommenderEnhanced:
 
         for idx in top_indices:
             item = valid_items.iloc[idx]
-            recommendations.append({
+            recommendation = {
                 'type': item['type'],
                 'size': item['size'],
                 'material': item['material'],
@@ -722,36 +769,61 @@ class ToyRecommenderEnhanced:
                 'brand': item['brand'],
                 'confidence_score': float(scores[idx]),
                 'price_range': item['price_range']
-            })
+            }
+
+            # Store recommendation in database
+            recommendation_id = self.db.add_recommendation(
+                user_id=user_id,
+                item_attributes=recommendation,
+                confidence_score=float(scores[idx]),
+                model_version=self.active_version
+            )
+
+            # Add recommendation_id to the response
+            recommendation['recommendation_id'] = recommendation_id
+            recommendations.append(recommendation)
 
         return recommendations
 
     def record_feedback(
             self,
             user_id: int,
-            recommendation: Dict,
+            recommendation_id: int,
             rating: float,
     ):
         """Record user feedback for a recommendation."""
-        # Create a unique item ID from the recommendation attributes
-        item_key = json.dumps({
-            k: recommendation[k]
-            for k in ['type', 'size', 'material', 'color', 'brand']
-        })
+        # Get recommendation details from database
+        with sqlite3.connect(self.db.db_path) as conn:  # Use self.db.db_path instead
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT item_attributes FROM recommendations WHERE recommendation_id = ?",
+                (recommendation_id,)
+            )
+            result = cursor.fetchone()
+            if result:
+                item_attributes = json.loads(result[0])
 
-        # Add to feedback database
-        self.feedback_db = pd.concat([
-            self.feedback_db,
-            pd.DataFrame([{
-                'user_id': user_id,
-                'item_attributes': json.dumps(recommendation),
-                'rating': rating,
-                'timestamp': datetime.datetime.now(),
-            }])
-        ], ignore_index=True)
+                # Add feedback
+                self.db.add_feedback(
+                    user_id=user_id,
+                    recommendation_id=recommendation_id,
+                    item_attributes=item_attributes,  # Duplicating for historical preservation
+                    rating=rating
+                )
 
-        # Retrain model with new feedback
-        self.fit()
+                # Update feedback_db for model training
+                self.feedback_db = pd.concat([
+                    self.feedback_db,
+                    pd.DataFrame([{
+                        'user_id': user_id,
+                        'item_attributes': json.dumps(item_attributes),
+                        'rating': rating,
+                        'timestamp': datetime.datetime.now(),
+                    }])
+                ], ignore_index=True)
+
+                # Retrain model with new feedback
+                self.fit()
 
     def fit(self):
         """Train the recommendation model with feedback data."""
@@ -828,46 +900,52 @@ if __name__ == "__main__":
     #     'material': ['plastic', 'fabric'],
     #     'type': ['arts_crafts', 'electronic']
     # }
-
+    #
     # recommender.db.add_user_preferences(1, user1_preferences)
     # recommender.db.add_user_preferences(2, user2_preferences)
+    #
+    # # Get recommendations based on user preferences
+    preferences_user_id = 2
+    preferences_user_data = recommender.db.get_user_preferences(preferences_user_id)
+    print(preferences_user_data)
+    user_data = {
+        'age': 11,
+        'gender': 'female',
+        'preferences': preferences_user_data
+    }
+    #
+    recommendations = recommender.recommend(
+        user_id=2,
+        user_data=user_data,
+        price_constraint=10,
+        n_recommendations=1
+    )
 
-    # Get recommendations based on user preferences
-#     user_data = {
-#         'age': 6,
-#         'gender': 'male',
-#         'preferences': recommender.db.get_user_preferences(1)
-#     }
-#
-#     recommendations = recommender.recommend(
-#         user_data=user_data,
-#         price_constraint=50,
-#         n_recommendations=3
-#     )
-#
-#     for i, rec in enumerate(recommendations, 1):
-#         print(f"\nRecommendation {i}:")
-#         print(f"Type: {rec['type']}")
-#         print(f"Size: {rec['size']}")
-#         print(f"Material: {rec['material']}")
-#         print(f"Color: {rec['color']}")
-#         print(f"Brand: {rec['brand']}")
-#         print(f"Price Range: {rec['price_range']}")
-#         print(f"Confidence Score: {rec['confidence_score']:.2f}")
-#
+    for i, rec in enumerate(recommendations, 1):
+        print(f"\nRecommendation {i}:")
+        print(f"Id: {rec['recommendation_id']}")
+        print(f"Type: {rec['type']}")
+        print(f"Size: {rec['size']}")
+        print(f"Material: {rec['material']}")
+        print(f"Color: {rec['color']}")
+        print(f"Brand: {rec['brand']}")
+        print(f"Price Range: {rec['price_range']}")
+        print(f"Confidence Score: {rec['confidence_score']:.2f}")
+
 # # # Record feedback
-#     recommender.db.add_feedback(
-#         user_id=1,
-#         item_attributes=recommendations[2],
-#         rating=4.5
+#     recommender.record_feedback(
+#         user_id=2,
+#         recommendation_id=11,
+#         rating=0
 #     )
-#
-    # recommender.fit()
 
     #
-    # Train new model version
-    try:
-        metrics = recommender.train_model()
-        print(f"New model trained: {metrics}")
-    except ValueError as e:
-        print(f"Training failed: {e}")
+    # # recommender.fit()
+    #
+    # #
+    # # Train new model version
+    # try:
+    #     metrics = recommender.train_model()
+    #     print(f"New model trained: {metrics}")
+    # except ValueError as e:
+    #     print(f"Training failed: {e}")
