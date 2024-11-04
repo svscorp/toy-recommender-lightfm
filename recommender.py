@@ -66,7 +66,6 @@ class DatabaseManager:
                     user_id TEXT,
                     item_attributes TEXT,
                     rating FLOAT,
-                    price_range TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 )
@@ -161,16 +160,15 @@ class DatabaseManager:
             user_id: int,
             item_attributes: Dict,
             rating: float,
-            price_range: str
     ):
         """Record user feedback."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """INSERT INTO feedback 
-                   (user_id, item_attributes, rating, price_range)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, json.dumps(item_attributes), rating, price_range)
+                   (user_id, item_attributes, rating)
+                   VALUES (?, ?, ?)""",
+                (user_id, json.dumps(item_attributes), rating)
             )
             conn.commit()
 
@@ -240,6 +238,11 @@ class ToyRecommenderEnhanced:
         self.db = DatabaseManager()
         self.model_manager = ModelManager()
 
+        # Initialize feedback database as DataFrame
+        self.feedback_db = pd.DataFrame(columns=[
+            'user_id', 'item_attributes', 'rating', 'timestamp'
+        ])
+
         # Load the active model if it exists
         active_version = self.db.get_active_model_version()
         self.model = (self.model_manager.load_model(active_version)
@@ -265,6 +268,11 @@ class ToyRecommenderEnhanced:
         # Generate synthetic items
         self.items_df = self._generate_item_combinations()
 
+        # Load existing feedback from database if any exists
+        existing_feedback = self.db.get_all_feedback()
+        if not existing_feedback.empty:
+            self.feedback_db = existing_feedback
+
     def _create_initial_model(self) -> LightFM:
         """Create and save initial model."""
         model = LightFM(
@@ -273,6 +281,36 @@ class ToyRecommenderEnhanced:
             no_components=64,
             user_alpha=1e-6,
             item_alpha=1e-6
+        )
+
+        # Create initial empty interaction matrix
+        n_users = 1
+        n_items = len(self.items_df)
+
+        # Create sparse interaction matrix
+        row = np.array([0])  # Single user
+        col = np.array([0])  # Single item
+        data = np.array([0.0])  # Single interaction value
+
+        interactions = coo_matrix(
+            (data, (row, col)),
+            shape=(n_users, n_items)
+        )
+
+        # Create feature matrices
+        user_features = csr_matrix((n_users, 8))  # 8 is the number of user features
+        item_features = csr_matrix(np.array([
+            self._create_item_features(item)
+            for _, item in self.items_df.iterrows()
+        ]))
+
+        # Fit the model with empty data
+        model.fit(
+            interactions,
+            user_features=user_features,
+            item_features=item_features,
+            epochs=1,
+            num_threads=4
         )
 
         # Save initial model metrics
@@ -293,10 +331,14 @@ class ToyRecommenderEnhanced:
         if feedback_data.empty:
             raise ValueError("No feedback data available for training")
 
-        # Prepare training data
-        train_data, val_data = train_test_split(
-            feedback_data, test_size=0.2 if validate else 0.0
-        )
+        # Only split if we have enough data
+        if len(feedback_data) > 5 and validate:  # Only split if we have more than 5 ratings
+            train_data, val_data = train_test_split(
+                feedback_data, test_size=0.2, random_state=42
+            )
+        else:
+            train_data = feedback_data
+            val_data = None if validate else None
 
         # Create new model
         new_model = LightFM(
@@ -313,7 +355,7 @@ class ToyRecommenderEnhanced:
             new_model,
             train_interactions,
             train_weights,
-            val_data if validate else None
+            val_data
         )
 
         # Save new model and metrics
@@ -328,8 +370,47 @@ class ToyRecommenderEnhanced:
 
     def _prepare_interactions(self, feedback_data: pd.DataFrame) -> Tuple[coo_matrix, coo_matrix]:
         """Prepare interaction matrices from feedback data."""
-        # Implementation details...
-        pass
+        """Prepare interaction matrices from feedback data."""
+        n_users = len(feedback_data['user_id'].unique())
+        n_items = len(self.items_df)
+
+        # Create sparse matrix in COO format
+        rows = []
+        cols = []
+        data = []
+
+        for idx, row in feedback_data.iterrows():
+            user_idx = self.user_encoder.fit_transform([row['user_id']])[0]
+            item_attr = json.loads(row['item_attributes'])
+
+            # Find the corresponding item in items_df
+            matching_items = self.items_df[
+                (self.items_df['type'] == item_attr['type']) &
+                (self.items_df['size'] == item_attr['size']) &
+                (self.items_df['material'] == item_attr['material']) &
+                (self.items_df['color'] == item_attr['color']) &
+                (self.items_df['brand'] == item_attr['brand'])
+                ]
+
+            if not matching_items.empty:
+                item_idx = matching_items.index[0]
+                rows.append(user_idx)
+                cols.append(item_idx)
+                data.append(row['rating'])
+
+        # Create interactions matrix
+        interactions = coo_matrix(
+            (data, (rows, cols)),
+            shape=(n_users, n_items)
+        )
+
+        # Create weights matrix (all 1.0 for now)
+        weights = coo_matrix(
+            (np.ones_like(data), (rows, cols)),
+            shape=(n_users, n_items)
+        )
+
+        return interactions, weights
 
     def _train_and_evaluate(
             self,
@@ -339,8 +420,63 @@ class ToyRecommenderEnhanced:
             val_data: Optional[pd.DataFrame] = None
     ) -> ModelMetrics:
         """Train model and compute metrics."""
-        # Implementation details...
-        pass
+        """Train model and compute metrics."""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        version = f"v{timestamp}"
+
+        metrics = ModelMetrics(version=version)
+
+        # Create feature matrices
+        n_users = train_interactions.shape[0]
+        user_features = csr_matrix((n_users, 8))
+        item_features = csr_matrix(np.array([
+            self._create_item_features(item)
+            for _, item in self.items_df.iterrows()
+        ]))
+
+        # Train the model
+        model.fit(
+            train_interactions,
+            user_features=user_features,
+            item_features=item_features,
+            sample_weight=train_weights,
+            epochs=30,
+            num_threads=4
+        )
+
+        # Calculate training metrics
+        train_predictions = model.predict(
+            user_ids=train_interactions.row,
+            item_ids=train_interactions.col,
+            user_features=user_features,
+            item_features=item_features
+        )
+
+        # Calculate RMSE instead of simple accuracy
+        actual_ratings = train_interactions.data
+        rmse = np.sqrt(np.mean((train_predictions - actual_ratings) ** 2))
+        mae = np.mean(np.abs(train_predictions - actual_ratings))
+
+        # Calculate validation metrics if validation data is provided
+        validation_rmse = None
+        if val_data is not None and not val_data.empty:
+            val_interactions, val_weights = self._prepare_interactions(val_data)
+            val_predictions = model.predict(
+                user_ids=val_interactions.row,
+                item_ids=val_interactions.col,
+                user_features=csr_matrix((val_interactions.shape[0], 8)),
+                item_features=item_features
+            )
+            validation_rmse = np.sqrt(np.mean((val_predictions - val_interactions.data) ** 2))
+
+        # Update metrics
+        metrics.accuracy = float(mae)  # Using MAE instead of binary accuracy
+        metrics.loss = float(rmse)  # Using RMSE as loss
+        metrics.train_size = len(actual_ratings)  # Using actual number of ratings
+        metrics.validation_accuracy = float(validation_rmse) if validation_rmse is not None else None
+        metrics.average_rating = float(np.mean(actual_ratings))
+
+        return metrics
 
     def _generate_item_combinations(self) -> pd.DataFrame:
         """Generate realistic combinations of toy attributes."""
@@ -447,23 +583,19 @@ class ToyRecommenderEnhanced:
         n_items = len(self.items_df)
 
         # Create sparse interaction matrix
-        row = np.array([0])  # Single user
-        col = np.array([0])  # Single item
-        data = np.array([0.0])  # Single interaction value
-
         interactions = coo_matrix(
-            (data, (row, col)),
+            ([0.0], ([0], [0])),
             shape=(n_users, n_items)
         )
 
-        # Create feature matrices
-        user_features = csr_matrix((n_users, 8))  # 8 is the number of user features
+        # Create feature matrices for all items
+        user_features = csr_matrix((n_users, 8))
         item_features = csr_matrix(np.array([
             self._create_item_features(item)
             for _, item in self.items_df.iterrows()
         ]))
 
-        # Fit the model
+        # Fit the model with empty data
         self.model.fit(
             interactions,
             user_features=user_features,
@@ -547,27 +679,34 @@ class ToyRecommenderEnhanced:
         else:
             valid_items = self.items_df
 
-        # Get predictions for all valid items
-        item_features = csr_matrix(np.array([
-            self._create_item_features(item)
-            for _, item in valid_items.iterrows()
-        ]))
-
-        # If we're in cold start (no feedback data)
-        if self.feedback_db.empty:
+        # If we're in cold start (no feedback data) or model hasn't been fitted
+        if len(self.feedback_db) == 0:
             # Use simple rule-based scoring
             scores = self._cold_start_scoring(user_data, valid_items)
         else:
-            # Use trained model for predictions
-            scores = [
-                self.model.predict(
-                    user_ids=[0],
-                    item_ids=[i],
-                    user_features=user_features,
-                    item_features=item_features[i].reshape(1, -1)
-                )[0]
-                for i in range(len(valid_items))
-            ]
+            try:
+                # Create feature matrices for all items
+                item_features = csr_matrix(np.array([
+                    self._create_item_features(item)
+                    for _, item in self.items_df.iterrows()  # Use full items_df
+                ]))
+
+                # Get indices of valid items
+                valid_indices = valid_items.index.values
+
+                # Try to use the trained model
+                scores = [
+                    self.model.predict(
+                        user_ids=[0],
+                        item_ids=[idx],
+                        user_features=user_features,
+                        item_features=item_features
+                    )[0]
+                    for idx in valid_indices
+                ]
+            except ValueError:
+                # If model isn't fitted, use cold start scoring
+                scores = self._cold_start_scoring(user_data, valid_items)
 
         # Get top N recommendations
         top_indices = np.argsort(scores)[-n_recommendations:][::-1]
@@ -592,7 +731,6 @@ class ToyRecommenderEnhanced:
             user_id: int,
             recommendation: Dict,
             rating: float,
-            price_range: str
     ):
         """Record user feedback for a recommendation."""
         # Create a unique item ID from the recommendation attributes
@@ -606,10 +744,9 @@ class ToyRecommenderEnhanced:
             self.feedback_db,
             pd.DataFrame([{
                 'user_id': user_id,
-                'item_id': item_key,
+                'item_attributes': json.dumps(recommendation),
                 'rating': rating,
                 'timestamp': datetime.datetime.now(),
-                'price_range': price_range
             }])
         ], ignore_index=True)
 
@@ -628,12 +765,25 @@ class ToyRecommenderEnhanced:
             cols = []
             data = []
 
+            # Create mapping of item_id to index
+            item_to_idx = {str(item_id): idx for idx, item_id in enumerate(self.items_df.index)}
+
             for idx, row in self.feedback_db.iterrows():
                 user_idx = self.user_encoder.fit_transform([row['user_id']])[0]
-                item_idx = self.item_encoder.fit_transform([row['item_id']])[0]
-                rows.append(user_idx)
-                cols.append(item_idx)
-                data.append(row['rating'])
+                item_attr = json.loads(row['item_attributes'])
+                # Find the corresponding item in items_df
+                matching_items = self.items_df[
+                    (self.items_df['type'] == item_attr['type']) &
+                    (self.items_df['size'] == item_attr['size']) &
+                    (self.items_df['material'] == item_attr['material']) &
+                    (self.items_df['color'] == item_attr['color']) &
+                    (self.items_df['brand'] == item_attr['brand'])
+                    ]
+                if not matching_items.empty:
+                    item_idx = matching_items.index[0]
+                    rows.append(user_idx)
+                    cols.append(item_idx)
+                    data.append(row['rating'])
 
             interactions = coo_matrix(
                 (data, (rows, cols)),
@@ -655,7 +805,6 @@ class ToyRecommenderEnhanced:
                 epochs=30,
                 num_threads=4
             )
-
 
 # Example usage
 if __name__ == "__main__":
@@ -684,29 +833,41 @@ if __name__ == "__main__":
     # recommender.db.add_user_preferences(2, user2_preferences)
 
     # Get recommendations based on user preferences
-    user_data = {
-        'age': 6,
-        'gender': 'male',
-        'preferences': recommender.db.get_user_preferences(1)
-    }
+#     user_data = {
+#         'age': 6,
+#         'gender': 'male',
+#         'preferences': recommender.db.get_user_preferences(1)
+#     }
+#
+#     recommendations = recommender.recommend(
+#         user_data=user_data,
+#         price_constraint=50,
+#         n_recommendations=3
+#     )
+#
+#     for i, rec in enumerate(recommendations, 1):
+#         print(f"\nRecommendation {i}:")
+#         print(f"Type: {rec['type']}")
+#         print(f"Size: {rec['size']}")
+#         print(f"Material: {rec['material']}")
+#         print(f"Color: {rec['color']}")
+#         print(f"Brand: {rec['brand']}")
+#         print(f"Price Range: {rec['price_range']}")
+#         print(f"Confidence Score: {rec['confidence_score']:.2f}")
+#
+# # # Record feedback
+#     recommender.db.add_feedback(
+#         user_id=1,
+#         item_attributes=recommendations[2],
+#         rating=4.5
+#     )
+#
+    # recommender.fit()
 
-    recommendations = recommender.recommend(
-        user_data=user_data,
-        price_constraint=50,
-        n_recommendations=3
-    )
-
-# # Record feedback
-    # recommender.db.add_feedback(
-    #     user_id=1,
-    #     item_attributes=recommendations[0],
-    #     rating=4.5,
-    #     price_range="medium"
-    # )
     #
-    # # Train new model version
-    # try:
-    #     metrics = recommender.train_model()
-    #     print(f"New model trained: {metrics}")
-    # except ValueError as e:
-    #     print(f"Training failed: {e}")
+    # Train new model version
+    try:
+        metrics = recommender.train_model()
+        print(f"New model trained: {metrics}")
+    except ValueError as e:
+        print(f"Training failed: {e}")
